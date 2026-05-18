@@ -65,3 +65,22 @@ class AttnMODULE(nn.Module):
         )
 
         return self.wo(out)
+    
+class AttnWrapper(nn.Module):
+    def __init__(self , in_channel , numhead):
+        super().__init__()
+        self.channel = in_channel
+        self.attn = AttnMODULE(numhead , in_channel)
+
+        self.norm = nn.LayerNorm(in_channel)
+
+    def forward(self , x):
+        b , c , h , w = x.shape
+        x_flat = x.view(b , c , -1).permute(0 , 2 , 1)
+
+        x_norm = self.norm(x_flat)
+
+        out = self.attn(x_norm , x_norm , x_norm)
+
+        out += x_flat
+        return out.permute(0 , 2 , 1).view(b , c , h , w)
