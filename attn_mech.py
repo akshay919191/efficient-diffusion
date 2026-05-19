@@ -84,3 +84,53 @@ class AttnWrapper(nn.Module):
 
         out += x_flat
         return out.permute(0 , 2 , 1).view(b , c , h , w)
+    
+
+class CrossAttentionBlock(nn.Module):
+
+    def __init__(
+        self,
+        channels,
+        text_dim,
+        num_heads
+    ):
+        super().__init__()
+
+        self.channels = channels
+
+        self.text_proj = nn.Linear(
+            text_dim,
+            channels
+        )
+
+        self.attn = AttnMODULE(
+            numhead=num_heads,
+            d_model=channels
+        )
+
+        self.norm = nn.GroupNorm(8, channels)
+
+    def forward(self, x, text_embeddings):
+
+        B, C, H, W = x.shape
+
+        residual = x
+
+        x = self.norm(x)
+
+        x = x.view(B, C, H * W).transpose(1, 2)
+
+        text_embeddings = self.text_proj(
+            text_embeddings
+        )
+
+        x = self.attn(
+            query=x,
+            key=text_embeddings,
+            value=text_embeddings
+        )
+
+        # reshape back
+        x = x.transpose(1, 2).view(B, C, H, W)
+
+        return x + residual
