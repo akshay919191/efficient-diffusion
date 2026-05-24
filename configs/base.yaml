@@ -1,0 +1,124 @@
+
+# ENVIRONMENT
+environment:
+  python_version: "3.10.12"
+  torch_version: "2.2.2"
+  cuda_version: "12.1"
+  device: "cuda"
+
+  seed: 42
+  deterministic: false
+
+# DATA
+data:
+  dataset_name: "flickr8k"
+  image_size: 256
+  batch_size: 8
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+
+# VAE CONFIG
+vae:
+  in_channels: 3
+  latent_channels: 16
+
+  kl_weight: 0.001
+  kl_clip_min: -4
+  kl_clip_max: 2
+
+  use_reparameterization: true
+
+  # IMPORTANT 
+  latent_scaling_factor: 1.0
+
+# TEXT ENCODER
+text_encoder:
+  model_name: "clip"
+  max_length: 77
+  dropout_unconditional: 0.10
+
+# UNET CONFIG
+unet:
+  latent_channels: 16
+  time_dim: 256
+
+  base_channels: 128
+  channel_mults: [1, 2, 4, 8]
+
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+
+  dropout: 0.1
+
+# DIFFUSION
+diffusion:
+  num_timesteps: 1000
+
+  beta_start: 0.0001
+  beta_end: 0.02
+
+  schedule: "linear"
+
+  # CFG (classifier-free guidance)
+  cfg_dropout: 0.10
+  guidance_scale: 7.5
+
+# TRAINING (VAE)
+vae_training:
+  epochs: 10
+  lr: 1e-4
+  weight_decay: 0.0
+
+  grad_clip: 1.0
+
+  use_amp: false
+  log_interval: 10
+
+# TRAINING (UNET)
+unet_training:
+  epochs: 40
+  lr: 1e-4
+  weight_decay: 0.01
+
+  grad_clip: 1.0
+
+  use_amp: false
+  accumulate_grad_steps: 1
+
+  save_every_epoch: 1
+  log_interval: 10
+
+# LATENT CACHING 
+cache:
+  enabled: true
+
+  save_latents: true
+  save_text_embeddings: true
+
+  save_unconditional_embedding: true
+
+  format: "pt"
+  cache_dir: "latent_cache"
+
+# SAMPLING / INFERENCE
+sampling:
+  num_steps: 50
+  eta: 0.0
+
+  use_cfg: true
+  guidance_scale: 7.5
+
+# LOGGING
+logging:
+  project_name: "my_diffusion"
+  use_tensorboard: true
+  use_wandb: false
+  save_images_every: 5
+
+# CHECKPOINTS
+checkpoint:
+  dir: "checkpoints"
+  save_optimizer: true
+  save_every: 1
+  resume: true

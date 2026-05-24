@@ -2,18 +2,26 @@ import torch
 import torch.nn as nn
 
 def ddpm_scheduler(T=1000, device="cpu"):
+
     betas = torch.linspace(1e-4, 0.02, T, device=device)
 
     alphas = 1.0 - betas
+
     alpha_hat = torch.cumprod(alphas, dim=0)
+
+    rooted_alpha_hat = torch.sqrt(alpha_hat)
+
+    rooted_one_minus = torch.sqrt(1.0 - alpha_hat)
 
     return {
         "beta": betas,
         "alpha": alphas,
-        "alpha_hat": alpha_hat
+        "alpha_hat": alpha_hat,
+        "rooted_alpha_hat": rooted_alpha_hat,
+        "rooted_one_minus": rooted_one_minus
     }
 
-scheduler = ddpm_scheduler(Time = 1000 , device = None)
+scheduler = ddpm_scheduler(T = 1000 , device = None)
 
 def noiseADD(x0 , noise , t):
     device = x0.device

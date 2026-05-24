@@ -1,0 +1,46 @@
+# Model weights
+*.pth
+*.pt
+*.pkl
+*.ckpt
+
+# Data
+data/
+datasets/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Build artifacts (CUDA kernels)
+*.so
+*.o
+*.egg-info/
+dist/
+build/
+kernels/**/__pycache__/
+
+# VS Code
+.vscode/
+
+# Logs and outputs
+logs/
+outputs/
+*.log
+*.json
+
+# Environment
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.dbtest.ipynb
+test.ipynb
