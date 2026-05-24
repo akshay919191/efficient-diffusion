@@ -40,45 +40,35 @@ MOTIVATION
 Trained on Flickr8k (8k images). Results show correct scene understanding 
 and text alignment despite limited training data and compute.
 
-FOLDER STRUCTURE
+## Folder Structure
 
-  diffusion-kernel-bench/
-  |
-  |-- configs/
-  |   `-- base.yaml                # all knobs (model size, kernel flags, etc.)
-  |
-  |-- data/
-  |   `-- flickr8k/                # downloaded & pre‑processed images + captions
-  |
-  |-- kernels/
-  |   |-- flashattn/
-  |   |   |-- flashattn.cu         # forward / backward fused kernel
-  |   |   `-- flashattn.h
-  |   |-- welford/
-  |   |   |-- welford.cu           # online mean/var + affine
-  |   |   `-- welford.h
-  |   |-- setup.py                # build script (python setup.py build_ext --inplace)
-  |   `-- __init__.py             # Python wrapper that loads the compiled modules
-  |
-  |-- models/
-  |   |-- unet.py                 # U‑Net definition (ResBlocks + Attention)
-  |   |-- vae.py                  # encoder / decoder
-  |   |-- attention.py            # pluggable attention: calls flashattn or pytorch
-  |   |-- norms.py                # LayerNorm/GroupNorm using welford when requested
-  |   |-- text_encoder.py         # a tiny CLIP‑like transformer for captions
-  |   `-- diffusion.py            # noise schedule, forward diffusion, losses
-  |
-  |-- benchmarks/
-  |   |-- run_kernels.py          # micro‑benchmark individual kernels
-  |   `-- profiler_utils.py       # helper to capture memory & timing traces
-  |
-  |-- scripts/
-  |   `-- dataaligning.py     # download & tokenise dataset
-  |
-  |-- train.py                    # main training loop with profiling hooks
-  |-- inference.py                # generate images; compare kernel/nonkernel modes
-  |-- requirements.txt
-  `-- README.md                   # you are reading it
+```
+diffusion-kernel-bench/
+├── configs/
+│   └── base.yaml
+├── kernels/
+│   ├── flashattn/
+│   │   ├── flashattn.cu
+│   │   └── flashattn.h
+│   ├── welford/
+│   │   ├── welford.cu
+│   │   └── welford.h
+│   ├── setup.py
+│   └── __init__.py
+├── models/
+│   ├── vae_unet.py
+│   ├── attn_mech.py
+│   └── clip_text.py
+├── scripts/
+│   ├── data_alinging.py
+│   ├── ddpm_ddim.py
+│   └── pipeline.py
+├── benchmarks/
+├── inferencePIPELINE.py
+├── training.py
+├── requirements.txt
+└── README.md
+```
 
 
 USAGE
