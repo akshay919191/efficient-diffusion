@@ -26,10 +26,10 @@ on a single consumer GPU.
 | Component      | Parameters | Status          |
 |---------------|-----------|-----------------|
 | VAE            | 37.41M    | Trained from scratch |
-| UNET           | 10.33M    | Trained from scratch |
+| UNET           | 50.79M    | Trained from scratch |
 | CLIP           | ~63M      | Frozen          |
-| **Trainable**  | **47.74M**|                 |
-| **Total**      | **~110M** |                 |
+| **Trainable**  | **88.20M**|                 |
+| **Total**      | **~151M** |                 |
 
 ## Training Journey
 - **VAE**: ~31 hours on RTX 3050 6GB (37.41M parameters)
@@ -39,8 +39,6 @@ on a single consumer GPU.
 Trained on Flickr8k (8k images). Results show correct scene understanding
 and text alignment despite limited training data and compute.
 
-<!-- Add your generated images here -->
-<!-- ![generated samples](outputs/generated_grid.png) -->
 
 ## Folder Structure
 

@@ -177,7 +177,7 @@ for epoch in range(START , END):
     totalloss = 0.0
     unet.train()
 
-    for i , batch in cacheLOADER:
+    for i , batch in cacheLOADER:🔥 
         optimizer1.zero_grad()
 
         latents = batch["latents"].to(DEVICE)  # as our latent shape is (1 , 4 , 32 , 32)

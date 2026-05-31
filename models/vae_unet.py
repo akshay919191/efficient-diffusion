@@ -53,58 +53,111 @@ class RESIDUAL(nn.Module):
 
 
 class UNET(nn.Module):
-    def __init__(self, input_dim, timedim , textDIM = 512):
+    def __init__(self, input_dim, timedim, textDIM=512):
         super().__init__()
         self.time_dim = timedim
 
         self.time_mlp = nn.Sequential(
-            nn.Linear(timedim, timedim),
+            nn.Linear(timedim, timedim * 4),
             nn.SiLU(),
-            nn.Linear(timedim, timedim)
+            nn.Linear(timedim * 4, timedim)
         )
 
-        self.enc1 = RESIDUAL(input_dim, 128, timedim)
-        self.down1 = nn.MaxPool2d(2)
+        self.enc1  = RESIDUAL(input_dim, 128, timedim)
+        self.enc1b = RESIDUAL(128, 128, timedim)
 
-        self.enc2 = RESIDUAL(128, 256, timedim)
-        self.down2 = nn.MaxPool2d(2)
+        self.down1 = nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1)  
 
-        self.bottleneck_res = RESIDUAL(256, 512, timedim)
-        self.attn = AttnWrapper(512, 8)
-        self.cross_attn = CrossAttentionBlock(channels=512, text_dim=textDIM, num_heads=8)
+        self.enc2  = RESIDUAL(128, 256, timedim)
+        self.enc2b = RESIDUAL(256, 256, timedim)
 
-        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec1 = RESIDUAL(512, 256, timedim) 
+        self.down2 = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)  
 
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec2 = RESIDUAL(256, 64, timedim)
+        self.enc3  = RESIDUAL(256, 512, timedim)
+        self.enc3b = RESIDUAL(512, 512, timedim)
 
-        self.final = nn.Conv2d(64, input_dim, kernel_size=1)
+        self.enc3b_self_attn  = AttnWrapper(512, 8)
+        self.enc3b_cross_attn = CrossAttentionBlock(channels=512, text_dim=textDIM, num_heads=8)
+
+        self.down3 = nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1)  
+
+        self.bot1          = RESIDUAL(512, 512, timedim)
+        self.bot_self_attn = AttnWrapper(512, 8)
+        self.bot_cross_attn = CrossAttentionBlock(channels=512, text_dim=textDIM, num_heads=8)
+        self.bot2          = RESIDUAL(512, 512, timedim)
+
+        self.up1   = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)     
+        self.dec1  = RESIDUAL(512 + 512, 512, timedim)   
+        self.dec1b = RESIDUAL(512, 512, timedim)
+
+        self.dec1b_self_attn  = AttnWrapper(512, 8)
+        self.dec1b_cross_attn = CrossAttentionBlock(channels=512, text_dim=textDIM, num_heads=8)
+
+        self.up2   = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)    
+        self.dec2  = RESIDUAL(256 + 256, 256, timedim)   
+        self.dec2b = RESIDUAL(256, 256, timedim)
+        self.dec2_cross = CrossAttentionBlock(channels=256, text_dim=textDIM, num_heads=4)
+
+        self.up3   = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)    
+        self.dec3  = RESIDUAL(128 + 128, 128, timedim)   
+        self.dec3b = RESIDUAL(128, 128, timedim)
+        self.dec3_self_attn  = AttnWrapper(128, 4)
+        self.dec3_cross = CrossAttentionBlock(channels=128, text_dim=textDIM, num_heads=4)
+
+        self.norm_out = nn.GroupNorm(num_groups=get_groups(128), num_channels=128)
+        self.act_out  = nn.SiLU()
+        self.final    = nn.Conv2d(128, input_dim, kernel_size=1)
 
     def forward(self, x, t, text_embeddings):
         t_emb = get_time_embedding(t, self.time_dim, device=t.device)
         t_emb = self.time_mlp(t_emb)
 
-        s1 = self.enc1(x, t_emb)
-        x = self.down1(s1)
+        x  = self.enc1(x, t_emb)
+        s1 = self.enc1b(x, t_emb)                        
 
-        s2 = self.enc2(x, t_emb)
-        x = self.down2(s2)
+        x  = self.down1(s1)                              
 
-        x = self.bottleneck_res(x, t_emb)
-        x = self.attn(x)
-        x = self.cross_attn(x, text_embeddings)
+        x  = self.enc2(x, t_emb)
+        s2 = self.enc2b(x, t_emb)                       
+
+        x  = self.down2(s2)                               
+
+        x  = self.enc3(x, t_emb)
+        x  = self.enc3b(x, t_emb)
+        x  = self.enc3b_self_attn(x)                     
+        x  = self.enc3b_cross_attn(x, text_embeddings)   
+        s3 = x                                            
+
+        x  = self.down3(s3)                         
+
+        x = self.bot1(x, t_emb)
+        x = self.bot_self_attn(x)
+        x = self.bot_cross_attn(x, text_embeddings)
+        x = self.bot2(x, t_emb)
 
         x = self.up1(x)
-        x = torch.cat([x, s2], dim=1) # Concatenate skip connection
+        x = torch.cat([x, s3], dim=1)
         x = self.dec1(x, t_emb)
+        x = self.dec1b(x, t_emb)
+        x = self.dec1b_self_attn(x)                      
+        x = self.dec1b_cross_attn(x, text_embeddings)    
 
         x = self.up2(x)
-        x = torch.cat([x, s1], dim=1) # Concatenate skip connection
+        x = torch.cat([x, s2], dim=1)
         x = self.dec2(x, t_emb)
+        x = self.dec2b(x, t_emb)
+        x = self.dec2_cross(x, text_embeddings)
 
+        x = self.up3(x)
+        x = torch.cat([x, s1], dim=1)
+        x = self.dec3(x, t_emb)
+        x = self.dec3b(x, t_emb)
+        x = self.dec3_self_attn(x)
+        x = self.dec3_cross(x, text_embeddings)
+
+        x = self.norm_out(x)
+        x = self.act_out(x)
         return self.final(x)
-
 
 def get_time_embedding(timesteps, embedding_dim, device=None):
     if device is None:

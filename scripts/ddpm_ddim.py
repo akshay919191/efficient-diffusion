@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def ddpm_scheduler(T=1000, device="cpu"):
+def ddpm_scheduler(T=1000, device="cuda"):
 
     betas = torch.linspace(1e-4, 0.02, T, device=device)
 

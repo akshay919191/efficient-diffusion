@@ -41,8 +41,7 @@ def get_custom_vae_latents(vae_model, clean_images):
     logvar = vae_model.logvar(latent_features)
     logvar = torch.clamp(logvar, -4, 2)
     
-    z = vae_model.reparameterize(mu, logvar)
-    return z
+    return mu
 
 empty_tokens = tokenizer(
     "",
