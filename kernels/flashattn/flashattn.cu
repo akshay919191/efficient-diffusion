@@ -763,14 +763,6 @@ __global__ void backwardFlashAttention(
 }
 
 
-// =========================================================================
-// PYTORCH BINDINGS (Replace your bottom wrapper code blocks with this)
-// =========================================================================
-
-// =========================================================================
-// PYTORCH BINDINGS
-// =========================================================================
-
 std::vector<torch::Tensor> flash_attn_forward(
     torch::Tensor q,
     torch::Tensor k,
