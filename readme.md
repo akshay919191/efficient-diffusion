@@ -33,7 +33,7 @@ on a single consumer GPU.
 
 ## Training Journey
 - **VAE**: ~31 hours on RTX 3050 6GB (37.41M parameters)
-- **UNET**: ~16 hours on RTX 3050 6GB (50.79M parameters)
+- **UNET**: ~6.5 day(still going) on RTX 3050 6GB (50.79M parameters)
 
 ## Generated Samples
 Trained on Flickr8k (8k images). Results show correct scene understanding
