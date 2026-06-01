@@ -287,7 +287,7 @@ class VAE(nn.Module):
     
 def vae_loss(x, recon_logits, mu, logvar, kl_weight=1e-4):
 
-    x = (x + 1.0) * 0.5  # [-1,1] → [0,1]
+    x = (x + 1.0) * 0.5  # [-1,1] -> [0,1]
 
     recon = F.mse_loss(torch.sigmoid(recon_logits), x, reduction="mean")
 

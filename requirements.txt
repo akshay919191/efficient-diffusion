@@ -4,7 +4,6 @@ torchaudio==2.2.2
 numpy
 tqdm
 matplotlib
-Pillow
 transformers
 tokenizers
 accelerate
