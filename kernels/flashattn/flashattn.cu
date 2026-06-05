@@ -6,6 +6,8 @@
 #include <iostream>
 #include <torch/extension.h>
 
+
+
 template<int HEAD_DIM, int Br, int Bc , int NUM_HEADS>
 __global__ void forwardFlashAttention(
     const half* __restrict__ Q,
@@ -137,16 +139,16 @@ __global__ void forwardFlashAttention(
                             __syncthreads();
                             asm volatile(
                                 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                                "{%0 , %1 , %2 , %3},"
-                                "{%4 , %5 , %6 , %7},"
-                                "{%8 , %9},"
-                                "{%10 , %11 , %12 , %13};"
-                                    :"=f"(d1) , "=f"(d2) , "=f"(d3) , "=f"(d4)
+                                "{%0,%1,%2,%3},"
+                                "{%4,%5,%6,%7},"
+                                "{%8,%9},"
+                                "{%10,%11,%12,%13};"    
+                                    : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
                                     : "r"(a_frag[0]), "r"(a_frag[1]),
                                     "r"(a_frag[2]), "r"(a_frag[3]),
                                     "r"(b_frag[0]), "r"(b_frag[1])
                                     ,"f"(d1),"f"(d2),"f"(d3),"f"(d4)
-                            );
+                                );
                         }
 
                         const int r0 = group;
@@ -154,10 +156,10 @@ __global__ void forwardFlashAttention(
                         const int c0 = (lane % 4) * 2;
                         const int c1 = c0 + 1 ;
 
-                        output[(tr * 16 + r0) * 32 + col * 8 + c0] += d1 * scale;
-                        output[(tr * 16 + r0) * 32 + col * 8 + c1] += d2 * scale;
-                        output[(tr * 16 + r1) * 32 + col * 8 + c0] += d3 * scale;
-                        output[(tr * 16 + r1) * 32 + col * 8 + c1] += d4 * scale;
+                        output[(tr * 16 + r0) * Bc + col * 8 + c0] += d1 * scale;
+                        output[(tr * 16 + r0) * Bc + col * 8 + c1] += d2 * scale;
+                        output[(tr * 16 + r1) * Bc + col * 8 + c0] += d3 * scale;
+                        output[(tr * 16 + r1) * Bc + col * 8 + c1] += d4 * scale;
                     }
                 }
             }
@@ -167,7 +169,7 @@ __global__ void forwardFlashAttention(
         for(int i = tid; i < Br * headdim / 8; i += blockDim.x)
         {
             *reinterpret_cast<float4*>(&vshared[i * 8]) =
-            *reinterpret_cast<const float4*>(&Vptr[rowid * 32 * headdim + i * 8]);
+            *reinterpret_cast<const float4*>(&Vptr[rowid * Bc * headdim + i * 8]);
         }
 
         __syncthreads();
@@ -208,7 +210,7 @@ __global__ void forwardFlashAttention(
                 
                 for(int cc = 0 ; cc < 2 ; cc++)
                 {
-                    for(int i = tid ; i < 16 / 16 ; i += blockDim.x)
+                    for(int i = tid ; i < 16 * 16 ; i += blockDim.x)
                     {
                         int r = i / 16;
                         int c = i % 16;
@@ -216,11 +218,10 @@ __global__ void forwardFlashAttention(
                         smenA[r * 16 + c] = __float2half_rn(output[iter * 16 * 32 + cc * 16 + r * 32 + c]);
                     }
 
-                    for(int i = tid ; i < 128 ; i += blockDim.x)
+                    for(int i = tid ; i < 16 * 8 ; i += blockDim.x)
                     {
                         int r = i / 8;
                         int c = i % 8;
-
                         smenB[r * 8 + c] = vshared[(cc * 16 + r) * headdim + colitr * 8 + c];
                     }
                     __syncthreads();
@@ -314,29 +315,56 @@ __global__ void backwardFlashAttention_DQ(
     const __half* __restrict__ O,
     const float* __restrict__ L_,         // Log-sum-exp statistics from Forward Pass [seq_len]
     __half* __restrict__ score,           // Shared/Global intermediate buffer
+    __half* __restrict__ dl_score_global,
     __half* __restrict__ dL_dout,         // Incoming gradients from output [seq_len, headdim]
-    __half* __restrict__ dL_dQ,           // Output Gradient Query [seq_len, headdim]
+    __half* __restrict__ dQ,           // Output Gradient Query [seq_len, headdim]
+    float* __restrict__ _dot,
     int seq_len,
     int headdim
 )
 
 {
-    __align__(16) extern __shared__ __half smen[];
+    extern __shared__ char smem_buffer[];  
 
-    __half* smenA    = (__half*)smen;                 
-    __half* smenB    = smenA   + (16 * 16);          
+    size_t offset = 0;
 
-    __half* qshared  = smenB   + (16 * 8);           
-    __half* kshared  = qshared + (Br * Bc);          
-    __half* vshared  = kshared + (Bc * Bc);           
-    __half* dl_dout  = vshared + (Bc * Bc);    
-    __half* dl_score = dl_dout + (Br * Bc);    
+    __half* smenA    = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += 16 * 16 * sizeof(__half);
 
-    __half* scores   = dl_score + (Br * Bc);           
-    __half* dl_ds    = scores   + (Br * Bc);           
+    __half* smenB    = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += 16 * 8 * sizeof(__half);
 
-    float* dot       = (float*)(dl_ds + (Br * Bc));
-    float* L         = (dot + Br);    
+    __half* qshared  = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Bc * sizeof(__half);
+
+    __half* kshared  = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Bc * Bc * sizeof(__half);
+
+    __half* vshared  = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Bc * Bc * sizeof(__half);
+
+    __half* dl_dout  = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Bc * sizeof(__half);
+
+    __half* dl_score = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Bc * sizeof(__half);
+
+    __half* scores   = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Bc * sizeof(__half);
+
+    __half* dl_ds    = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Bc * sizeof(__half);
+
+    offset = (offset + sizeof(float) - 1) / sizeof(float) * sizeof(float);
+
+    float* dot       = reinterpret_cast<float*>(smem_buffer + offset);
+    offset += Br * sizeof(float);
+
+    float* L         = reinterpret_cast<float*>(smem_buffer + offset);
+    offset += Br * sizeof(float);
+
+    float* dq_accum  = reinterpret_cast<float*>(smem_buffer + offset);
+    offset += Br * headdim * sizeof(float);
 
     const int batchid = blockIdx.x;
     const int headid  = blockIdx.y;
@@ -346,10 +374,11 @@ __global__ void backwardFlashAttention_DQ(
     const long long base = (long long)batchid * seq_len * headdim * NUM_HEADS +
                             (long long)headid * seq_len * headdim;
 
-    const __half* Qptr = Q + base;
-    const __half* Kptr = K + base;
-    const __half* Vptr = V + base;
-    const __half* Optr = O + base;
+    const __half* Qptr  = Q + base;
+    const __half* Kptr  = K + base;
+    const __half* Vptr  = V + base;
+    const __half* Optr  = O + base;
+          __half* dL_dQ = dQ + base;
 
     const __half* outP = dL_dout + base;
 
@@ -362,6 +391,9 @@ __global__ void backwardFlashAttention_DQ(
 
     if(tid < Br)
         L[tid] = L_[rowtileid * Br + tid];
+    
+    if(tid < Br) dot[tid] = 0.f;
+        __syncthreads();
 
     for(int col = 0 ; col < rowINitr ; col++)
     {
@@ -392,14 +424,37 @@ __global__ void backwardFlashAttention_DQ(
             for(int k = 0; k < Bc; k++)
                 sum += __half2float(dl_dout[tid * Bc + k]) *
                     __half2float(qshared[tid * Bc + k]);
-            dot[rowtileid * Br + tid] += sum;   // accumulate over col tiles
+            dot[tid] += sum;   // accumulate over col tiles
         }
 
         __syncthreads();
     }
 
+    if (tid < Br) {
+        long long dot_global_idx = (long long)batchid * NUM_HEADS * seq_len + 
+                                (long long)headid * seq_len + 
+                                (rowtileid * Br + tid);
+        
+        if ((rowtileid * Br + tid) < seq_len) {
+            _dot[dot_global_idx] = dot[tid];
+        }
+    }
+
+    for(int i = tid; i < Br * headdim; i += blockDim.x)
+        dq_accum[i] = 0.f;
+    __syncthreads();
+
+
     for(int rowid = 0 ; rowid < total ; rowid++)
     {
+
+        for(int i = tid; i < Br * Bc; i += blockDim.x)
+            scores[i] = __float2half(0.f);
+
+        for(int i = tid; i < Br * Bc; i += blockDim.x)
+            dl_score[i] = __float2half(0.f);
+        __syncthreads();
+
         // we need Q @ K.T
         for(int colitr = 0 ; colitr < rowINitr ; colitr++)
         {
@@ -448,13 +503,12 @@ __global__ void backwardFlashAttention_DQ(
                                 *reinterpret_cast<const float4*>(&qshared[rr * 16 * Bc + col * 16 + r * Bc + c * 8]);
                         }
 
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
+                        for(int i = tid ; i < 16 * 8 ; i += blockDim.x)
                         {
-                            int r = i;
-                            int c = i % 1;
+                            int r = i / 8;
+                            int c = i % 8;
 
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&kshared[cc * 8 + col * 16 * Bc + r * headdim + c * 8]);
+                            smenB[r * 8 + c] = kshared[cc * 8 + col * 16 * Bc + r * Bc + c];
                         }
 
                         __syncthreads();
@@ -462,13 +516,13 @@ __global__ void backwardFlashAttention_DQ(
                         // we have smen loaded we can do mma now
                         uint32_t a_frag[4];
 
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = c0 + 8;
+                        const int col0 = (lane % 4) * 2;
+                        const int col1 = col0 + 8;
 
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c1]);
+                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col0]);
+                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col0]);
+                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col1]);
+                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col1]);
 
                         uint32_t b_frag[2];
 
@@ -476,8 +530,9 @@ __global__ void backwardFlashAttention_DQ(
                         const int r1 = r0 + 8;
 
                         b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
+
                         b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
-                    
+
                         asm volatile(
                             "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                             "{%0,%1,%2,%3},"
@@ -485,11 +540,12 @@ __global__ void backwardFlashAttention_DQ(
                             "{%8,%9},"
                             "{%10,%11,%12,%13};"
                             : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
-                            : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
-                            "r"(b_frag[0]), "r"(b_frag[1]),
-                            "f"(d1), "f"(d2), "f"(d3), "f"(d4)
+                            : "r"(a_frag[0]), "r"(a_frag[1]),                            
+                            "r"(a_frag[2]), "r"(a_frag[3]),
+                            "r"(b_frag[0]), "r"(b_frag[1])
+                            ,"f"(d1),"f"(d2),"f"(d3),"f"(d4)
                         ); 
-
+                        __syncthreads();
                     }
 
                     // now map this
@@ -513,6 +569,21 @@ __global__ void backwardFlashAttention_DQ(
 
                 }
             }
+            __syncthreads();
+
+            for(int i = tid; i < Br * Bc; i += blockDim.x)
+            {
+                int r = i / Bc;
+                int c = i % Bc;
+                long long score_base = (long long)batchid * NUM_HEADS * seq_len * seq_len
+                                    + (long long)headid  * seq_len * seq_len;
+
+                int global_row = rowtileid * Br + r;
+                int global_col = rowid    * Bc + c;
+
+                score[score_base + global_row * seq_len + global_col] = scores[r * Bc + c];
+            }
+            __syncthreads();
         
             // dl_score = dl_out (Br , Bc) and V.T (Bc , Bc) -> (Br , Bc)
 
@@ -534,6 +605,7 @@ __global__ void backwardFlashAttention_DQ(
 
                 vshared[c * Bc + r] = Vptr[rowid * Bc * headdim + colitr * Bc + r * headdim + c];
             }
+            __syncthreads();
 
             for(int rr = 0 ; rr < Tr ; rr++)
             {
@@ -552,27 +624,25 @@ __global__ void backwardFlashAttention_DQ(
                                 *reinterpret_cast<const float4*>(&dl_dout[rr * 16 * Bc + col * 16 + r * Bc + c * 8]);
                         }
 
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
+                        for(int i = tid ; i < 16 * 8 ; i += blockDim.x)
                         {
-                            int r = i;
-                            int c = i % 1;
+                            int r = i / 8;
+                            int c = i % 8;
 
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&vshared[cc * 8 + col * 16 * Bc + r * headdim + c * 8]);
+                            smenB[r * 8 + c] = vshared[cc * 8 + col * 16 * Bc + r * Bc + c];
                         }
 
                         __syncthreads();
 
-                        // we have smen loaded we can do mma now
                         uint32_t a_frag[4];
 
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = c0 + 8;
+                        const int col0 = (lane % 4) * 2;
+                        const int col1 = col0 + 8;
 
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c1]);
+                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col0]);
+                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col0]);
+                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col1]);
+                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col1]);
 
                         uint32_t b_frag[2];
 
@@ -580,8 +650,9 @@ __global__ void backwardFlashAttention_DQ(
                         const int r1 = r0 + 8;
 
                         b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
+
                         b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
-                    
+
                         asm volatile(
                             "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                             "{%0,%1,%2,%3},"
@@ -589,24 +660,24 @@ __global__ void backwardFlashAttention_DQ(
                             "{%8,%9},"
                             "{%10,%11,%12,%13};"
                             : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
-                            : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
-                            "r"(b_frag[0]), "r"(b_frag[1]),
-                            "f"(d1), "f"(d2), "f"(d3), "f"(d4)
+                            : "r"(a_frag[0]), "r"(a_frag[1]),                            
+                            "r"(a_frag[2]), "r"(a_frag[3]),
+                            "r"(b_frag[0]), "r"(b_frag[1])
+                            ,"f"(d1),"f"(d2),"f"(d3),"f"(d4)
                         ); 
-
+                         __syncthreads();
                     }
 
-                    // now map this
-                    const int r0 = group;
-                    const int r1 = r0 + 8;
+                    const int out_row0 = group;
+                    const int out_row1 = out_row0 + 8;
 
-                    const int c0 = (lane % 4) * 2;
-                    const int c1 = c0 + 1;
+                    const int out_col0 = (lane % 4) * 2;
+                    const int out_col1 = out_col0 + 1;
 
-                    const int idx_d1 = rr * 16 * Bc + cc * 8 + r0 * Bc + c0;
-                    const int idx_d2 = rr * 16 * Bc + cc * 8 + r0 * Bc + c1;
-                    const int idx_d3 = rr * 16 * Bc + cc * 8 + r1 * Bc + c0;
-                    const int idx_d4 = rr * 16 * Bc + cc * 8 + r1 * Bc + c1;
+                    const int idx_d1 = rr * 16 * Bc + cc * 8 + out_row0 * Bc + out_col0;
+                    const int idx_d2 = rr * 16 * Bc + cc * 8 + out_row0 * Bc + out_col1;
+                    const int idx_d3 = rr * 16 * Bc + cc * 8 + out_row1 * Bc + out_col0;
+                    const int idx_d4 = rr * 16 * Bc + cc * 8 + out_row1 * Bc + out_col1;
 
                     dl_score[idx_d1] = __float2half(__half2float(dl_score[idx_d1]) + d1);
                     dl_score[idx_d2] = __float2half(__half2float(dl_score[idx_d2]) + d2);
@@ -615,52 +686,46 @@ __global__ void backwardFlashAttention_DQ(
 
                     // dl_score shapes are Br * Bc
                 }
+                __syncthreads();
             }
-        }   
-        
-            __syncthreads();
+        } 
+            
 
-            // recompute S = softmax(score) using saved L
             for(int i = tid; i < Br * Bc; i += blockDim.x)
             {
                 int r = i / Bc;
                 int c = i % Bc;
 
                 float val = __half2float(scores[r * Bc + c]);
-                float s   = expf(val / sqrtf((float)headdim) - L[rowtileid * Br + r]);
+                float s   = expf(val / sqrtf((float)headdim) - L[r]);
                 scores[r * Bc + c] = __float2half(s);   // now scores holds S
             }
+            __syncthreads();
 
             for(int i = tid ; i < Br * Bc ; i += blockDim.x)
             {
                 int r = i / Bc;
                 int c = i % Bc;
-
                 float val = __half2float(dl_score[r * Bc + c]);
-                float s   = val - dot[r];
-                s = s / sqrtf(headdim);
-
+                float s = val - dot[r];  
                 dl_score[r * Bc + c] = __float2half(s);
-
             }
+            __syncthreads();
 
             for(int i = tid ; i < Br * Bc ; i += blockDim.x)
             {
-                // we need scores * dl_score
                 int r = i / Bc; 
                 int c = i % Bc;
 
-                float val1 = __half2float(scores[r * Bc + c]) , val2 = __half2float(dl_score[r * Bc + c]);
-                val1 = val1 * val2;
-
-                dl_ds[r * Bc + c] = __float2half(val1);
+                float val1 = __half2float(scores[r * Bc + c]);
+                float val2 = __half2float(dl_score[r * Bc + c]);
+                
+                dl_ds[r * Bc + c] = __float2half(val1 * val2);
             }
 
             __syncthreads();
 
             // now we have proper dl/ds
-
-            // now load Kshared
             for(int x = 0 ; x < headdim / Bc ; x++)
             {
                 for(int i = tid ; i < Bc * Bc / 8 ; i += blockDim.x)
@@ -671,616 +736,135 @@ __global__ void backwardFlashAttention_DQ(
                     *reinterpret_cast<float4*>(&kshared[r * Bc + c * 8]) = 
                         *reinterpret_cast<const float4*>(&Kptr[rowid * Bc * headdim + x * Bc + r * headdim + c * 8]);
                 }
-                __syncthreads();
+                __syncthreads(); //
 
-                for(int Trow = 0 ; Trow < Br / 16 ; Trow++)
+            for(int i = tid; i < Br * Bc; i += blockDim.x)
+            {
+                int r = i / Bc;
+                int c = i % Bc;
+
+                long long score_base = (long long)batchid * NUM_HEADS * seq_len * seq_len
+                                    + (long long)headid  * seq_len * seq_len;
+
+                int global_row = rowtileid * Br + r;
+                int global_col = rowid    * Bc + c;
+
+                dl_score_global[score_base + global_row * seq_len + global_col] = dl_ds[r * Bc + c];
+            }  
+            __syncthreads();
+
+            for(int Trow = 0 ; Trow < Br / 16 ; Trow++)
+            {
+                for(int tcc = 0 ; tcc < Bc / 8 ; tcc++)
                 {
-                    for(int tcc = 0 ; tcc < Bc / 8 ; tcc++)
+                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
+
+                    for(int tcr = 0 ; tcr < Bc / 16 ; tcr++)
                     {
-
-                        float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
-
-                        for(int tcr = 0 ; tcr < Bc / 16 ; tcr++)
+                        for(int i = tid ; i < 16 * 16 / 8 ; i += blockDim.x)
                         {
-                            for(int i = tid ; i < 16 * 16 / 8 ; i += blockDim.x)
-                            {
-                                int r = i / (16 / 8);
-                                int c = i % (16 / 8);
+                            int r = i / (16 / 8);
+                            int c = i % (16 / 8);
 
-                                *reinterpret_cast<float4*>(&smenA[r * 16 + c * 8]) =    
-                                    *reinterpret_cast<const float4*>(&dl_ds[Trow * 16 * Bc + tcc * 8 + tcr * 16 + r * Bc + c * 8]);
-                            }
+                            *reinterpret_cast<float4*>(&smenA[r * 16 + c * 8]) =    
+                                *reinterpret_cast<const float4*>(&dl_ds[Trow * 16 * Bc + tcr * 16 + r * Bc + c * 8]);
+                        }
 
-                            for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
-                            {
-                                int r = i / (8 / 8);
-                                int c = i % (8 / 8);
+                        // Load smenB from row-major kshared tile
+                        for(int i = tid ; i < 16 * 8 ; i += blockDim.x)
+                        {
+                            int r = i / 8;
+                            int c = i % 8;
 
-                                *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) =
-                                    *reinterpret_cast<float4*>(&kshared[tcc * 8 + tcr * 16 * Bc + r * Bc + r * 8]);
-                            }
-
-                            uint32_t a_frag[4];
-                            const int c0 = (lane % 4) * 2;
-                            const int c1 = c0 + 8;
-
-                            a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c0]);
-                            a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c0]);
-                            a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c1]);
-                            a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c1]);
-
-                            uint32_t b_frag[2];
-                            const int r0 = (lane % 4) * 2;
-                            const int r1 = r0 + 8;
-
-                            b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
-                            b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
+                            smenB[r * 8 + c] = kshared[tcc * 8 + tcr * 16 * Bc + r * Bc + c];
+                        }
                         
-                            asm volatile(
-                                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                                "{%0,%1,%2,%3},"
-                                "{%4,%5,%6,%7},"
-                                "{%8,%9},"
-                                "{%10,%11,%12,%13};"
-                                : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
-                                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
-                                "r"(b_frag[0]), "r"(b_frag[1]),
-                                "f"(d1), "f"(d2), "f"(d3), "f"(d4) 
-                            ); 
-                            
-                        }
+                        __syncthreads();
 
-                        // now we need to map it 
-                        const int r0 = group;
-                        const int r1 = r0 + 8;
+                        uint32_t a_frag[4];
+                        const int smenA_col0 = (lane % 4) * 2;
+                        const int smenA_col1 = smenA_col0 + 8;
 
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = c0 + 1;
+                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + smenA_col0]);
+                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + smenA_col0]);
+                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + smenA_col1]);
+                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + smenA_col1]);
 
-                        const int global_idx = rowtileid * Br * headdim + x * Bc;
+                        uint32_t b_frag[2];
+                        const int smenB_row0 = (lane % 4) * 2;
+                        const int smenB_row1 = smenB_row0 + 8;
 
-                        const int idx_d1 = Trow * 16 * headdim + tcc * 8 + r0 * headdim + c0;
-                        const int idx_d2 = Trow * 16 * headdim + tcc * 8 + r0 * headdim + c1; 
-                        const int idx_d3 = Trow * 16 * headdim + tcc * 8 + r1 * headdim + c0;
-                        const int idx_d4 = Trow * 16 * headdim + tcc * 8 + r1 * headdim + c1;
+                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[smenB_row0 * 8 + group])) | 
+                                    (uint32_t(__half_as_ushort(smenB[(smenB_row0 + 1) * 8 + group])) << 16));
 
-                        dL_dQ[idx_d1] = __float2half(__half2float(dL_dQ[global_idx + idx_d1]) + d1);
-                        dL_dQ[idx_d2] = __float2half(__half2float(dL_dQ[global_idx + idx_d2]) + d2);
-                        dL_dQ[idx_d3] = __float2half(__half2float(dL_dQ[global_idx + idx_d3]) + d3);
-                        dL_dQ[idx_d4] = __float2half(__half2float(dL_dQ[global_idx + idx_d4]) + d4);
+                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[smenB_row1 * 8 + group])) | 
+                                    (uint32_t(__half_as_ushort(smenB[(smenB_row1 + 1) * 8 + group])) << 16));
 
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3},"
+                            "{%4,%5,%6,%7},"
+                            "{%8,%9},"
+                            "{%10,%11,%12,%13};"
+                            : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
+                            : "r"(a_frag[0]), "r"(a_frag[1]),                            
+                            "r"(a_frag[2]), "r"(a_frag[3]),
+                            "r"(b_frag[0]), "r"(b_frag[1]),
+                            "f"(d1),"f"(d2),"f"(d3),"f"(d4)
+                        ); 
+                        
+                        __syncthreads();
                     }
-                }
+                    
+                    const int thread_row0 = lane / 4;
+                    const int thread_row1 = thread_row0 + 8;
+
+                    const int thread_col0 = (lane % 4) * 2;
+                    const int thread_col1 = thread_col0 + 1;
+
+                    const int idx_d1 = Trow * 16 * headdim + thread_row0 * headdim + (x * Bc + tcc * 8 + thread_col0);
+                    const int idx_d2 = Trow * 16 * headdim + thread_row0 * headdim + (x * Bc + tcc * 8 + thread_col1);
+                    const int idx_d3 = Trow * 16 * headdim + thread_row1 * headdim + (x * Bc + tcc * 8 + thread_col0);
+                    const int idx_d4 = Trow * 16 * headdim + thread_row1 * headdim + (x * Bc + tcc * 8 + thread_col1);
+
                 
+                    const float bwd_scale = 1.0f / sqrtf((float)headdim);
+                    dq_accum[idx_d1] += d1 * bwd_scale;
+                    dq_accum[idx_d2] += d2 * bwd_scale;
+                    dq_accum[idx_d3] += d3 * bwd_scale;
+                    dq_accum[idx_d4] += d4 * bwd_scale;
+                    }
+                    __syncthreads();
             }
-            
+        }
     }
+    const size_t global_offset = (size_t)rowtileid * Br * headdim;
+    for (size_t i = tid; i < (size_t)Br * headdim; i += blockDim.x) {
+        dL_dQ[global_offset + i] = __float2half(dq_accum[i]);
+    }
+
 }
 
 
 
-
-template<int Br , int Bc , int NUM_HEADS>
-__global__ void backwardFlashAttention_DK_DV(
-    const __half* __restrict__ Q,         
-    const __half* __restrict__ K,        
-    const __half* __restrict__ V,         
-    const __half* __restrict__ O,  
-    const float* __restrict__ L_,         
-    __half* __restrict__ score,           
-    __half* __restrict__ dL_dout,        
-    __half* __restrict__ dL_dK,           
-    __half* __restrict__ dL_dV,           
-    int seq_len,
-    int headdim
-)
-{
-    __align__(16) extern __shared__ __half smen[];
-
-    __half* smenA    = (__half*)smen;                 
-    __half* smenB    = smenA   + (16 * 16);          
-
-    __half* qshared  = smenB   + (16 * 8);           
-    __half* kshared  = qshared + (Br * Bc);          
-    __half* vshared  = kshared + (Bc * Bc);           
-    __half* dl_dout  = vshared + (Bc * Bc);    
-    __half* dl_score = dl_dout + (Br * Bc);    
-
-    __half* scores   = dl_score + (Br * Bc);           
-    __half* dl_ds    = scores   + (Br * Bc);           
-
-    float* dot       = (float*)(dl_ds + (Br * Bc));
-    float* L         = (dot + Br);    
-
-    const int batchid = blockIdx.x;
-    const int headid  = blockIdx.y;
-    const int tileid  = blockIdx.z;
-    const int tid     = threadIdx.x;
-
-    const long long base = (long long)batchid * seq_len * headdim * NUM_HEADS +
-                            (long long)headid * seq_len * headdim;
-
-    const __half* Qptr = Q + base;
-    const __half* Kptr = K + base;
-    const __half* Vptr = V + base;
-    const __half* Optr = O + base;
-
-    const __half* outP = dL_dout + base;
-
-    const int lane  = tid % 32;
-    const int group = lane / 4;
-
-
-    const int rowtileid = tileid;
-    const int total     = seq_len / Br;
-    const int colitr    = headdim / Bc;
-
-    for(int rowid = 0 ; rowid < total ; rowid++)
-    {   
-        if(tid < Br)
-            L[tid] = L_[rowtileid * Br + tid];
-
-        for(int col = 0 ; col < colitr ; col++)
-        {
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {   
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&qshared[r * Bc + c * 8]) = 
-                    *reinterpret_cast<const float4*>(&Qptr[rowid * Br * headdim + col * Bc + r * headdim + c * 8]);
-            }
-
-            for(int i = tid ; i < Bc * Bc ; i += blockDim.x)
-            {
-                int r = i / Bc;
-                int c = i % Bc;
-
-                kshared[c * Bc + r] = Kptr[rowtileid * Bc * headdim + col * Bc + r * headdim + c];
-            }
-
-            __syncthreads();
-
-            const int rr = Br / 16;
-            const int cc = Bc / 16;
-            const int Tc = Bc / 8 ;
-
-            for(int row = 0 ; row < rr ; row++)
-            {
-                for(int co = 0 ; co < Tc ; co++)
-                {
-                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
-
-                    for(int colit = 0 ; colit < cc ; colit++)
-                    {
-                        for(int i = tid ; i < 16 * 16 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (16 / 8);
-                            int c = i % (16 / 8);
-
-                            *reinterpret_cast<float4*>(&smenA[r * 16 + c * 8]) =  
-                                *reinterpret_cast<const float4*>(&qshared[row * Bc * 16 + colit * 16 + r * Bc + c * 8]);
-                        }
-
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (8 / 8);
-                            int c = i % (8 / 8);
-
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&kshared[colit * 16 * Bc + co * 8 + r * Bc + c * 8]);
-                        }
-
-                        __syncthreads();
-
-                        uint32_t a_frag[4];
-
-                        const int r0 = (lane % 4) * 2;
-                        const int r1 = r0 + 8;
-
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r1]);
-
-                        uint32_t b_frag[2];
-
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = co + 8;
-
-                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[c0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c0 + 1) * 8 + group])) << 16));
-                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[c1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c1 + 1) * 8 + group])) << 16));
-
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                            "{%0,%1,%2,%3},"
-                            "{%4,%5,%6,%7},"
-                            "{%8,%9},"
-                            "{%10,%11,%12,%13};"
-                            :"=f"(d1) , "=f"(d2) , "=f"(d3) ,"=f"(d4)
-                            :"r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]),
-                             "r"(b_frag[0]) , "r"(b_frag[1]),
-                             "f"(d1) , "f"(d2) , "f"(d3) ,"f"(d4)
-                        );
-
-                    }
-
-                    const int r0 = group;
-                    const int r1 = r0 + 8;
-                    const int c0 = (lane % 4) * 2;
-                    const int c1 = c0 + 1;
-
-                    const int idx0 = row * 16 * Bc + co * 8 + r0 * Bc + co;
-                    const int idx1 = row * 16 * Bc + co * 8 + r0 * Bc + c1;
-                    const int idx2 = row * 16 * Bc + co * 8 + r1 * Bc + co;
-                    const int idx3 = row * 16 * Bc + co * 8 + r1 * Bc + c1;
-
-                    scores[idx0] = __float2half(__half2float(scores[idx0]) + d1);
-                    scores[idx1] = __float2half(__half2float(scores[idx1]) + d2);
-                    scores[idx2] = __float2half(__half2float(scores[idx2]) + d3);
-                    scores[idx3] = __float2half(__half2float(scores[idx3]) + d4);
-                }
-            }
-
-            // 
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {   
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&dl_dout[r * Bc + c * 8]) = 
-                    *reinterpret_cast<const float4*>(&outP[rowid * Br * headdim + col * Bc + r * headdim + c * 8]);
-            }
-
-            for(int i = tid ; i < Bc * Bc ; i += blockDim.x)
-            {
-                int r = i / Bc;
-                int c = i % Bc;
-
-                vshared[c * Bc + r] = Vptr[rowtileid * Bc * headdim + col * Bc + r * headdim + c];
-            }
-
-            __syncthreads();
-
-
-            for(int row = 0 ; row < rr ; row++)
-            {
-                for(int co = 0 ; co < Tc ; co++)
-                {
-                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
-
-                    for(int colit = 0 ; colit < cc ; colit++)
-                    {
-                        for(int i = tid ; i < 16 * 16 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (16 / 8);
-                            int c = i % (16 / 8);
-
-                            *reinterpret_cast<float4*>(&smenA[r * 16 + c * 8]) =  
-                                *reinterpret_cast<const float4*>(&dl_dout[row * Bc * 16 + colit * 16 + r * Bc + c * 8]);
-                        }
-
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (8 / 8);
-                            int c = i % (8 / 8);
-
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&vshared[colit * 16 * Bc + co * 8 + r * Bc + c * 8]);
-                        }
-
-                        __syncthreads();
-
-                        uint32_t a_frag[4];
-
-                        const int r0 = (lane % 4) * 2;
-                        const int r1 = r0 + 8;
-
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r1]);
-
-                        uint32_t b_frag[2];
-
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = co + 8;
-
-                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[c0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c0 + 1) * 8 + group])) << 16));
-                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[c1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c1 + 1) * 8 + group])) << 16));
-
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                            "{%0,%1,%2,%3},"
-                            "{%4,%5,%6,%7},"
-                            "{%8,%9},"
-                            "{%10,%11,%12,%13};"
-                            :"=f"(d1) , "=f"(d2) , "=f"(d3) ,"=f"(d4)
-                            :"r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]),
-                             "r"(b_frag[0]) , "r"(b_frag[1]),
-                             "f"(d1) , "f"(d2) , "f"(d3) ,"f"(d4)
-                        );
-
-                    }
-
-                    const int r0 = group;
-                    const int r1 = r0 + 8;
-                    const int c0 = (lane % 4) * 2;
-                    const int c1 = c0 + 1;
-
-                    const int idx0 = row * 16 * Bc + co * 8 + r0 * Bc + co;
-                    const int idx1 = row * 16 * Bc + co * 8 + r0 * Bc + c1;
-                    const int idx2 = row * 16 * Bc + co * 8 + r1 * Bc + co;
-                    const int idx3 = row * 16 * Bc + co * 8 + r1 * Bc + c1;
-
-                    dl_score[idx0] = __float2half(__half2float(dl_score[idx0]) + d1);
-                    dl_score[idx1] = __float2half(__half2float(dl_score[idx1]) + d2);
-                    dl_score[idx2] = __float2half(__half2float(dl_score[idx2]) + d3);
-                    dl_score[idx3] = __float2half(__half2float(dl_score[idx3]) + d4);
-                }
-            }
-            // we have scores now(not full but as we need same order DL/DV loading so after bracket we can use like full)
-        }
-
-        // we need dot now
-        for(int col = 0 ; col < headdim / Bc ; col++)
-        {
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&dl_dout[r * Bc + c * 8]) = 
-                    *reinterpret_cast<const float4*>(&outP[rowid * Br * headdim + col * Bc + r * headdim + c * 8]);
-            }
-
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {
-                // we will use qshared for out(O)
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&qshared[r * Bc + c * 8]) = 
-                    *reinterpret_cast<const float4*>(&Optr[rowid * Br * headdim + col * Bc + r * headdim + c * 8]);
-            }
-
-            __syncthreads();
-
-            if(tid < Br)
-            {
-                float sum = 0.f;
-                for(int k = 0; k < Bc; k++)
-                    sum += __half2float(dl_dout[tid * Bc + k]) *
-                        __half2float(qshared[tid * Bc + k]);
-                dot[rowtileid * Br + tid] += sum;   // accumulate over col tiles
-            }
-
-            __syncthreads();
-        }
-
-        for(int i = tid ; i < Br * Bc ; i += blockDim.x)
-        {
-            int r = i / Bc;
-            int c = i % Bc;
-
-            float val = __half2float(scores[r * Bc + c]);
-            val = expf(val / sqrtf((float)headdim)) - L[r];
-            scores[r * Bc + c] = __float2half(val);
-        }
-
-        for(int i = tid ; i < Br * Bc ; i += blockDim.x)
-        {
-            int r = i / Bc;
-            int c = i % Bc;
-
-            float val = __half2float(dl_score[r * Bc + c]);
-            val = val - dot[r];
-            val = val / sqrtf(headdim);
-            dl_score[r * Bc + c] = __float2half(val);
-        }
-
-        for(int i = tid ; i < Br * Bc ; i += blockDim.x)
-            {
-                // we need scores * dl_score
-                int r = i / Bc; 
-                int c = i % Bc;
-
-                float val1 = __half2float(scores[r * Bc + c]) , val2 = __half2float(dl_score[r * Bc + c]);
-                val1 = val1 * val2;
-
-                dl_ds[c * Bc + r] = __float2half(val1); // we need it in transposed form
-            }
-
-        __syncthreads();
-
-        for(int row = 0 ; row < seq_len / Br ; row++)
-        {
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&qshared[r * Bc + c * 8]) =
-                    *reinterpret_cast<const float4*>(&Qptr[rowid * Br * headdim + row * Bc + r * Bc + c * 8]);
-            }
-
-            __syncthreads();
-
-            for(int rr = 0 ; rr < Br / 16 ; rr++)
-            {
-                for(int cc = 0 ; cc < Bc / 8 ; cc++)
-                {
-                    float d1=0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
-
-                    for(int rc = 0 ; rc < Bc / 16 ; rc++)
-                    {
-                        for(int i = tid ; i < 16 * 16 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (16 / 8);
-                            int c = i % (16 / 8);
-
-                            *reinterpret_cast<float4*>(&smenA[r * 16 + c * 8]) =
-                                *reinterpret_cast<const float4*>(&dl_score[rr * 16 * Bc + rc * 16 + r * Bc + c * 8]);
-                        }
-
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (8 / 8);
-                            int c = i % (8 / 8);
-
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&qshared[cc * 8 + rc * 16 * Bc + r * Bc + c * 8]);
-                        }
-
-                        uint32_t a_frag[4];
-
-                        const int r0 = (lane % 4) * 2;
-                        const int r1 = r0 + 8;
-
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + r1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r1]);
-
-                        uint32_t b_frag[2];
-
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = c0 + 8;
-
-                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[c0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c0 + 1) * 8 + group])) << 16));
-                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[c1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c1 + 1) * 8 + group])) << 16));
-
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                            "{%0,%1,%2,%3},"
-                            "{%4,%5,%6,%7},"
-                            "{%8,%9},"
-                            "{%10,%11,%12,%13};"
-                            :"=f"(d1) , "=f"(d2) , "=f"(d3) ,"=f"(d4)
-                            :"r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]),
-                             "r"(b_frag[0]) , "r"(b_frag[1]),
-                             "f"(d1) , "f"(d2) , "f"(d3) ,"f"(d4)
-                        );
-                    }
-
-                    const int r0 = group;
-                    const int r1 = r0 + 8;
-                    const int c0 = (lane % 4) * 2;
-                    const int c1 = c0 + 1;
-
-                    const int global1 = row * Bc + rowid * Br * headdim;
-
-                    const int idx0 = global1 + r0 * 8 + c0;
-                    const int idx1 = global1 + r0 * 8 + c1;
-                    const int idx2 = global1 + r1 * 8 + c0;
-                    const int idx3 = global1 + r1 * 8 + c1;
-
-                    dL_dK[idx0] = __float2half(__half2float(dL_dK[idx0]) + d1);
-                    dL_dK[idx1] = __float2half(__half2float(dL_dK[idx1]) + d2);
-                    dL_dK[idx2] = __float2half(__half2float(dL_dK[idx2]) + d3);
-                    dL_dK[idx3] = __float2half(__half2float(dL_dK[idx3]) + d4);
-
-                }
-            }
-
-        }
-
-        for(int w = 0 ; w < colitr ; w++)
-        {
-            for(int i = tid ; i < Br * Bc / 8 ; i += blockDim.x)
-            {
-                int r = i / (Bc / 8);
-                int c = i % (Bc / 8);
-
-                *reinterpret_cast<float4*>(&dl_dout[r * Bc + c * 8]) = 
-                    *reinterpret_cast<const float4*>(&Optr[rowid * Br * headdim + w * Bc + r * headdim + c * 8]);
-            }
-            __syncthreads();
-
-            // now we have proper scores and dl_dout
-            // mma here and write it to global
-
-            for(int row = 0 ; row < Br / 16 ; row++)
-            {
-                for(int co = 0 ; co < Bc / 8 ; co++)
-                {
-                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
-
-                    for(int colit = 0 ; colit < Bc / 16 ; colit++)
-                    {
-                        for(int i = tid ; i < 16 * 16 ; i += blockDim.x)
-                        {
-                            int r = i / 16;
-                            int c = i % 16;
-
-                            smenA[c * 16 + r] = scores[row * 16 * Bc + colit * 16 + r * 16 + c];
-                        }
-
-                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
-                        {
-                            int r = i / (8 / 8);
-                            int c = i % (8 / 8);
-
-                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
-                                *reinterpret_cast<const float4*>(&dl_dout[co * 8 + colit * 16 * Bc + r * Bc + c * 8]);
-                        }
-
-                        __syncthreads();
-
-                        const int c0 = (lane % 4) * 2;
-                        const int c1 = c0 + 8;
-
-                        uint32_t a_frag[4];
-
-                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c0]);
-                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c0]);
-                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + c1]);
-                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + c1]);
-
-                        uint32_t b_frag[2];
-
-                        const int r0 = (lane % 4) * 2;
-                        const int r1 = r0 + 8;
-
-                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
-                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
-
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                            "{%0,%1,%2,%3},"
-                            "{%4,%5,%6,%7},"
-                            "{%8,%9},"
-                            "{%10,%11,%12,%13};"
-                            :"=f"(d1) , "=f"(d2) , "=f"(d3) , "=f"(d4)
-                            :"r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]) ,
-                             "r"(b_frag[0]) , "r"(b_frag[1]) ,
-                             "f"(d1) , "f"(d2) , "f"(d3) , "f"(d4)
-                        );
-                    }
-
-                    // now just write it on HBM
-                    const int c0 = (lane % 4) * 2;
-                    const int c1 = c0 + 1;
-                    const int r0 = group;
-                    const int r1 = r0 + 8;
-
-                    const int gloal_ = rowtileid * Br * headdim + w * Bc;
-
-                    const int idx0 = gloal_ + row * headdim * 16 + co * 8 + r0 * 8 + c0;
-                    const int idx1 = gloal_ + row * headdim * 16 + co * 8 + r0 * 8 + c1;
-                    const int idx2 = gloal_ + row * headdim * 16 + co * 8 + r1 * 8 + c0;
-                    const int idx3 = gloal_ + row * headdim * 16 + co * 8 + r1 * 8 + c1;
-
-                    dL_dV[idx0] = __float2half(__half2float(dL_dV[idx0]) + d1);
-                    dL_dV[idx1] = __float2half(__half2float(dL_dV[idx1]) + d2);
-                    dL_dV[idx2] = __float2half(__half2float(dL_dV[idx2]) + d3);
-                    dL_dV[idx3] = __float2half(__half2float(dL_dV[idx3]) + d4);
-
-                }
-            }
-
-        }
-    }
-}
+// template<int Br , int Bc , int NUM_HEADS>
+// __global__ void backwardFlashAttention_DK_DV(
+//     const __half* __restrict__ Q,             // Added (Needed by wrapper)
+//     const __half* __restrict__ K,        
+//     const __half* __restrict__ V,  
+//     const __half* __restrict__ O,             // Added (Needed by wrapper)
+//     const float* __restrict__ L_,    
+//     __half* __restrict__ score,               // Removed 'const' to match wrapper
+//     __half* __restrict__ dl_score_global,     // Added (Your global validation buffer!)
+//     const float* __restrict__ _dot,       
+//     const __half* __restrict__ dL_dout,        
+//     __half* __restrict__ dL_dK,           
+//     __half* __restrict__ dL_dV,           
+//     int seq_len,
+//     int headdim+
+// )
+// {
+    
+// }
 
 #include "flashattn.h"
