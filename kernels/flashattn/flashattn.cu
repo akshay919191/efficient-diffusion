@@ -390,7 +390,9 @@ __global__ void backwardFlashAttention_DQ(
     const int rowINitr  = headdim / Bc;  // even though its kinda obvious we are covering a row all columns at once just a safe sanity check
 
     if(tid < Br)
-        L[tid] = L_[rowtileid * Br + tid];
+        L[tid] = L_[(long long)batchid * NUM_HEADS * seq_len + 
+             (long long)headid  * seq_len + 
+             rowtileid * Br + tid];
     
     if(tid < Br) dot[tid] = 0.f;
         __syncthreads();
@@ -1023,10 +1025,15 @@ __global__ void backwardFlashAttention_DK_DV(
 
             // from here we need to save it globally
 
-            const size_t global_offset = base + (size_t)rowtileid * Br * headdim + rowid * Br;
-                for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
-                    dL_dV[global_offset + i] = __float2half(acc[i]);
-                }
+            const size_t global_offset = (size_t)base 
+                    + (size_t)rowtileid * Br * headdim 
+                    + rowid * Br;
+            for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
+                int r = i / Br;
+                int c = i % Br;
+                size_t idx = global_offset + r * headdim + c;  
+                atomicAdd(reinterpret_cast<__half*>(&dL_dV[idx]), __float2half(acc[i]));
+            }
             
             __syncthreads();
 
@@ -1038,6 +1045,8 @@ __global__ void backwardFlashAttention_DK_DV(
 
                 DL_ds[c * Br + r] = DSpt[rowtileid * Br + colitr * Br * seq_len + r * seq_len + c];
             }
+            __syncthreads();
+
             for(int i = tid; i < Br * Br; i += blockDim.x)
             {
                 DL_ds[i] = __float2half(__half2float(DL_ds[i]) / sqrtf((float)headdim));
@@ -1138,9 +1147,12 @@ __global__ void backwardFlashAttention_DK_DV(
                 }
             } // 
 
-            const size_t globadl = base + (size_t)rowtileid * Br * headdim + rowid * Br;
-            for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
-                dL_dK[globadl + i] = __float2half(acc[i]);
+            const size_t globadl = (size_t)base + (size_t)rowtileid * Br * headdim + rowid * Br;
+                        for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
+                int r = i / Br;
+                int c = i % Br;
+                size_t idx = globadl + r * headdim + c; 
+                atomicAdd(reinterpret_cast<__half*>(&dL_dK[idx]), __float2half(acc[i]));
             }
             __syncthreads();
         }
