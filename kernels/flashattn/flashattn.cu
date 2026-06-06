@@ -1134,9 +1134,9 @@ __global__ void backwardFlashAttention_DK_DV(
                     acc[idx2] += d3;
                     acc[idx3] += d4;
 
-                    __syncthreads();
+                    __syncthreads(); 
                 }
-            }
+            } // 
 
             const size_t globadl = base + (size_t)rowtileid * Br * headdim + rowid * Br;
             for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
