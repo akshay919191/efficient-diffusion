@@ -1,0 +1,40 @@
+maths behind flashattn
+
+## forward pass
+score = Q@K.tranpose(-1 , -2)
+S = torch.softmax(score / math.sqrt(headdim) , dim = -1)
+out = S@V
+
+## backward pass
+dl_dout = S@V (same as out)
+
+dl_DV   = S.tranpose(-1 , -2) @ dl_out (backpropagtion do tranpose)
+dl_DS   = dl_dout @ V.tranpose(-1 , -2)
+
+## for score we will use chain rule
+dl_Dscore = dl_dout * dout_DS * DS_Dscore 
+
+DS_Dscore is a softmax so its derivative is Ds_ij(δ_jk -  Ds_ik)
+but DS_Dscore = δ_zk
+
+there for we do chain rule which ends up like this 
+ 
+ {
+ what is i , j , k 
+ i is which row 
+ j is which softmax output in that row
+ k is which input in that row
+ 
+ ∂S/∂z , this show how output changes according to input and that's what we want
+ }
+ Ds_ij(δ_jk -  Ds_ik)(this is how scores changes accoding to softmax)
+ 
+ we can find accorsding to input
+ dz_ij = sigma(DL/δ_Sik * δ_Sik/δ_zij)       ##sigma over K
+ dz_ij = sigma(dS_ik * S_ik(δ_kj - S_ij))
+ 
+ split the sgima
+ dz_ij = Ds_ij*S_ij - S_ij(sigma(dS_ik*S_ik))
+ dz_ij = S_ij(Ds_ij - sigma(dS_ik*S_ik))
+ 
+ this is backawrd and DQ and DK from this

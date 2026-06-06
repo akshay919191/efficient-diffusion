@@ -104,7 +104,7 @@ std::vector<torch::Tensor> flash_attn_backward(
             static_cast<int>(d)                                // 8. headdim
         );
 
-    return {dq, dk, dv , score_buf , dl_score_buf};
+    return {dq, dk, dv};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
