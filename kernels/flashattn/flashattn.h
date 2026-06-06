@@ -52,18 +52,23 @@ std::vector<torch::Tensor> flash_attn_backward(
     auto dk = torch::zeros_like(k);
     auto dv = torch::zeros_like(v);
 
-    auto score_buf = torch::zeros({b, h, s, s}, q.options());
+    // Intermediate VRAM sharing buffers
+    auto score_buf    = torch::zeros({b, h, s, s}, q.options());
     auto dl_score_buf = torch::zeros({b, h, s, s}, q.options());
-    
-    auto global_dot = torch::zeros({b, h, s}, q.options().dtype(torch::kFloat32));
+    auto global_dot   = torch::zeros({b, h, s}, q.options().dtype(torch::kFloat32));
 
-    const int Br = 32;
-    dim3 grid(b, h, s / Br);
-    dim3 block(32);
-    size_t smem = 48 * 1024;
+    const int Br_dq = 32;
+    dim3 grid_dq(b, h, s / Br_dq); // Maps to s / 32 blocks
+    dim3 block_dq(32);             // Matches your DQ block structure
+    size_t smem_dq = 48 * 1024;
+
+    const int Br_dkv = 64;
+    dim3 grid_dkv(b, h, s / Br_dkv); 
+    dim3 block_dkv(128);             
+    size_t smem_dkv = 48 * 1024;
 
     if (d == 64) {
-        backwardFlashAttention_DQ<32, 64, 8><<<grid, block, smem>>>(
+        backwardFlashAttention_DQ<32, 64, 8><<<grid_dq, block_dq, smem_dq>>>(
             (const half*)q.data_ptr<at::Half>(), (const half*)k.data_ptr<at::Half>(), (const half*)v.data_ptr<at::Half>(),
             (const half*)o.data_ptr<at::Half>(), lse.data_ptr<float>(),
             (half*)score_buf.data_ptr<at::Half>(), (half*)dl_score_buf.data_ptr<at::Half>(),
@@ -72,7 +77,7 @@ std::vector<torch::Tensor> flash_attn_backward(
             static_cast<int>(s), static_cast<int>(d)
         );
     } else {
-        backwardFlashAttention_DQ<32, 32, 8><<<grid, block, smem>>>(
+        backwardFlashAttention_DQ<32, 32, 8><<<grid_dq, block_dq, smem_dq>>>(
             (const half*)q.data_ptr<at::Half>(), (const half*)k.data_ptr<at::Half>(), (const half*)v.data_ptr<at::Half>(),
             (const half*)o.data_ptr<at::Half>(), lse.data_ptr<float>(),
             (half*)score_buf.data_ptr<at::Half>(), (half*)dl_score_buf.data_ptr<at::Half>(),
@@ -82,7 +87,18 @@ std::vector<torch::Tensor> flash_attn_backward(
         );
     }
 
-    return {dq, score_buf, dl_score_buf};
+    backwardFlashAttention_DK_DV<64, 8><<<grid_dkv, block_dkv, smem_dkv>>>(
+            (const half*)q.data_ptr<at::Half>(),               // 1. Q
+            (const half*)score_buf.data_ptr<at::Half>(),             // 2. score (reused as dl_ds)
+            (const half*)dl_score_buf.data_ptr<at::Half>(),          // 3. dl_score_global
+            (const half*)d_out.data_ptr<at::Half>(),           // 4. dL_dout
+            (half*)dk.data_ptr<at::Half>(),                    // 5. dL_dK
+            (half*)dv.data_ptr<at::Half>(),                    // 6. dL_dV
+            static_cast<int>(s),                               // 7. seq_len
+            static_cast<int>(d)                                // 8. headdim
+        );
+
+    return {dq, dk, dv};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

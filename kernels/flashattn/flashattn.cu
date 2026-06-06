@@ -570,20 +570,6 @@ __global__ void backwardFlashAttention_DQ(
                 }
             }
             __syncthreads();
-
-            for(int i = tid; i < Br * Bc; i += blockDim.x)
-            {
-                int r = i / Bc;
-                int c = i % Bc;
-                long long score_base = (long long)batchid * NUM_HEADS * seq_len * seq_len
-                                    + (long long)headid  * seq_len * seq_len;
-
-                int global_row = rowtileid * Br + r;
-                int global_col = rowid    * Bc + c;
-
-                score[score_base + global_row * seq_len + global_col] = scores[r * Bc + c];
-            }
-            __syncthreads();
         
             // dl_score = dl_out (Br , Bc) and V.T (Bc , Bc) -> (Br , Bc)
 
@@ -752,6 +738,19 @@ __global__ void backwardFlashAttention_DQ(
                 dl_score_global[score_base + global_row * seq_len + global_col] = dl_ds[r * Bc + c];
             }  
             __syncthreads();
+            for(int i = tid; i < Br * Bc; i += blockDim.x)
+            {
+                int r = i / Bc;
+                int c = i % Bc;
+                long long score_base = (long long)batchid * NUM_HEADS * seq_len * seq_len
+                                    + (long long)headid  * seq_len * seq_len;
+
+                int global_row = rowtileid * Br + r;
+                int global_col = rowid    * Bc + c;
+
+                score[score_base + global_row * seq_len + global_col] = scores[r * Bc + c];
+            }
+            __syncthreads();
 
             for(int Trow = 0 ; Trow < Br / 16 ; Trow++)
             {
@@ -847,24 +846,304 @@ __global__ void backwardFlashAttention_DQ(
 
 
 
-// template<int Br , int Bc , int NUM_HEADS>
-// __global__ void backwardFlashAttention_DK_DV(
-//     const __half* __restrict__ Q,             // Added (Needed by wrapper)
-//     const __half* __restrict__ K,        
-//     const __half* __restrict__ V,  
-//     const __half* __restrict__ O,             // Added (Needed by wrapper)
-//     const float* __restrict__ L_,    
-//     __half* __restrict__ score,               // Removed 'const' to match wrapper
-//     __half* __restrict__ dl_score_global,     // Added (Your global validation buffer!)
-//     const float* __restrict__ _dot,       
-//     const __half* __restrict__ dL_dout,        
-//     __half* __restrict__ dL_dK,           
-//     __half* __restrict__ dL_dV,           
-//     int seq_len,
-//     int headdim+
-// )
-// {
-    
-// }
 
+template<int Br , int NUM_HEADS>
+__global__ void backwardFlashAttention_DK_DV(
+    const __half* __restrict__ Q,             
+    const __half* __restrict__ score,               
+    const __half* __restrict__ dl_score_global,     
+    const __half* __restrict__ dL_dout,        
+    __half* __restrict__ dL_dK,           
+    __half* __restrict__ dL_dV,           
+    int seq_len,
+    int headdim
+)
+{
+    extern __shared__ char smem_buffer[];  
+
+    size_t offset = 0;
+
+    __half* smenA = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += 16 * 16 * sizeof(__half);
+
+    __half* smenB = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += 16 * 8 * sizeof(__half);
+
+    __half* dscore = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Br * sizeof(__half);
+
+    __half* DQ = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Br * sizeof(__half);
+
+    __half* DL_ds = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Br * sizeof(__half);
+
+    __half* dl_out = reinterpret_cast<__half*>(smem_buffer + offset);
+    offset += Br * Br * sizeof(__half);
+
+    float* acc     = reinterpret_cast<float*>(smem_buffer + offset);
+    offset += Br * Br * sizeof(float);
+
+    const int batchid = blockIdx.x;
+    const int headid  = blockIdx.y;
+    const int tileid  = blockIdx.z;
+
+    const int tid     = threadIdx.x;
+
+    const int lane    = tid % 32;
+    const int group   = lane / 4;
+
+    const long long base = (long long)batchid * NUM_HEADS * seq_len * headdim + 
+                            (long long)headid * seq_len * headdim;
+    
+    const long long score_base = (long long)batchid * NUM_HEADS * seq_len * seq_len +
+                                 (long long)headid  * seq_len * seq_len;
+
+    const __half* Qptr = Q               + base;
+    const __half* Sptr = score           + score_base;
+    const __half* DSpt = dl_score_global + score_base;
+    const __half* Optr = dL_dout         + base;
+
+    const int rowitr    = headdim / Br;
+    const int coll      = seq_len / Br;
+    const int rowtileid = tileid;
+
+    // as we doing same for both 64 * 64 @ 64 * 64 so same vars can reduce registers 
+    const int Tr = Br / 16;
+    const int Tc = Br /  8;
+    // we need one more but as our dim is 64 so we can reuse Tr
+    
+    for(int colitr = 0 ; colitr < coll ; colitr++)
+    { 
+        for(int rowid = 0 ; rowid < rowitr ; rowid++)
+        {
+            // we going for DV
+            for(int i = tid ; i < Br * Br ; i += blockDim.x)
+            {
+                int r = i / Br;
+                int c = i % Br;
+
+                dscore[c * Br + r] = Sptr[rowtileid * Br + colitr * Br * seq_len + r * seq_len + c];
+            }
+
+            for(int i = tid ; i < Br * Br / 8 ; i += blockDim.x)
+            {
+                int r = i / (Br / 8);
+                int c = i % (Br / 8);
+
+                *reinterpret_cast<float4*>(&dl_out[r * Br + c * 8]) = 
+                    *reinterpret_cast<const float4*>(&Optr[colitr * Br * headdim + rowid * Br + r * headdim + c * 8]);
+            }
+
+            __syncthreads(); // it is important so we do not run into race condition
+
+            for(int i = tid ; i < Br * Br ; i += blockDim.x)
+                acc[i] = 0.f; __syncthreads();
+            
+            for(int rr = 0 ; rr < Tr ; rr++)
+            {
+                for(int cc = 0 ; cc < Tc ; cc++)
+                {
+                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
+
+                    for(int col = 0 ; col < Tr ; col++)
+                    {
+                        for(int i = tid ; i < 16 * 16 ; i += blockDim.x)
+                        {
+                            int r = i / 16;
+                            int c = i % 16;
+
+                            smenA[r * 16 + c] = dscore[rr * 16 * Br + col * 16 + r * Br + c];
+                        }
+
+                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
+                        {
+                            int r = i / (8 / 8);
+                            int c = i % (8 / 8);
+
+                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
+                                *reinterpret_cast<const float4*>(&dl_out[cc * 8 + col * 16 * Br + r * Br + c * 8]);
+                        }
+                        __syncthreads();
+
+                        const int r0 = (lane % 4) * 2;
+                        const int r1 = r0 + 8;
+
+                        uint32_t a_frag[4];
+
+                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group * 16      + r0]);
+                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r0]);
+                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group * 16      + r1]);
+                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r1]);
+
+                        const int c0 = (lane % 4) * 2;
+                        const int c1 = c0 + 8;
+
+                        uint32_t b_frag[2];
+
+                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[c0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c0 + 1) * 8 + group])) << 16));
+                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[c1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c1 + 1) * 8 + group])) << 16));
+                        
+                        __syncthreads();
+
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3},"
+                            "{%4,%5,%6,%7},"
+                            "{%8,%9},"
+                            "{%10,%11,%12,%13};"
+                            :"=f"(d1) , "=f"(d2) , "=f"(d3) , "=f"(d4)
+                            : "r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]) , 
+                              "r"(b_frag[0]) , "r"(b_frag[1]),
+                              "f"(d1) , "f"(d2) , "f"(d3) , "f"(d4)
+                        );
+                    }
+                    __syncthreads();
+
+                    const int r0 = group;
+                    const int r1 = r0 + 8;
+                    const int c0 = (lane % 4) * 2;
+                    const int c1 = c0 + 1;
+
+                    const int global = rr * 16 * Br + cc * 8;
+                    
+                    const int idx0 = global + r0 * Br + c0;
+                    const int idx1 = global + r0 * Br + c1;
+                    const int idx2 = global + r1 * Br + c0;
+                    const int idx3 = global + r1 * Br + c1;
+
+                    acc[idx0] += d1;
+                    acc[idx1] += d2;
+                    acc[idx2] += d3;
+                    acc[idx3] += d4;
+
+                    __syncthreads();
+                }
+            }
+
+            // from here we need to save it globally
+
+            const size_t global_offset = base + (size_t)rowtileid * Br * headdim + rowid * Br;
+                for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
+                    dL_dV[global_offset + i] = __float2half(acc[i]);
+                }
+            
+            __syncthreads();
+
+            // we going for DV
+            for(int i = tid ; i < Br * Br ; i += blockDim.x)
+            {
+                int r = i / Br;
+                int c = i % Br;
+
+                DL_ds[c * Br + r] = DSpt[rowtileid * Br + colitr * Br * seq_len + r * seq_len + c];
+            }
+            for(int i = tid; i < Br * Br; i += blockDim.x)
+            {
+                DL_ds[i] = __float2half(__half2float(DL_ds[i]) / sqrtf((float)headdim));
+            }
+            __syncthreads();
+
+            for(int i = tid ; i < Br * Br / 8 ; i += blockDim.x)
+            {
+                int r = i / (Br / 8);
+                int c = i % (Br / 8);
+
+                *reinterpret_cast<float4*>(&DQ[r * Br + c * 8]) = 
+                    *reinterpret_cast<const float4*>(&Qptr[colitr * Br * headdim + rowid * Br + r * headdim + c * 8]);
+            }
+
+            __syncthreads(); // it is important so we do not run into race condition
+            for(int i = tid ; i < Br * Br ; i += blockDim.x)
+                acc[i] = 0.f; __syncthreads();
+            
+            for(int rr = 0 ; rr < Tr ; rr++)
+            {
+                for(int cc = 0 ; cc < Tc ; cc++)
+                {
+                    float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
+
+                    for(int col = 0 ; col < Tr ; col++)
+                    {
+                        for(int i = tid ; i < 16 * 16 ; i += blockDim.x)
+                        {
+                            int r = i / 16;
+                            int c = i % 16;
+
+                            smenA[r * 16 + c] = DL_ds[rr * 16 * Br + col * 16 + r * Br + c];
+                        }
+
+                        for(int i = tid ; i < 16 * 8 / 8 ; i += blockDim.x)
+                        {
+                            int r = i / (8 / 8);
+                            int c = i % (8 / 8);
+
+                            *reinterpret_cast<float4*>(&smenB[r * 8 + c * 8]) = 
+                                *reinterpret_cast<const float4*>(&DQ[cc * 8 + col * 16 * Br + r * Br + c * 8]);
+                        }
+                        __syncthreads();
+
+                        const int r0 = (lane % 4) * 2;
+                        const int r1 = r0 + 8;
+
+                        uint32_t a_frag[4];
+
+                        a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group * 16      + r0]);
+                        a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r0]);
+                        a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group * 16      + r1]);
+                        a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + r1]);
+
+                        const int c0 = (lane % 4) * 2;
+                        const int c1 = c0 + 8;
+
+                        uint32_t b_frag[2];
+
+                        b_frag[0] = (uint32_t(__half_as_ushort(smenB[c0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c0 + 1) * 8 + group])) << 16));
+                        b_frag[1] = (uint32_t(__half_as_ushort(smenB[c1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(c1 + 1) * 8 + group])) << 16));
+                        
+                        __syncthreads();
+
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3},"
+                            "{%4,%5,%6,%7},"
+                            "{%8,%9},"
+                            "{%10,%11,%12,%13};"
+                            :"=f"(d1) , "=f"(d2) , "=f"(d3) , "=f"(d4)
+                            : "r"(a_frag[0]) , "r"(a_frag[1]) , "r"(a_frag[2]) , "r"(a_frag[3]) , 
+                              "r"(b_frag[0]) , "r"(b_frag[1]),
+                              "f"(d1) , "f"(d2) , "f"(d3) , "f"(d4)
+                        );
+                    }
+
+                    // from here we need to save it globally
+                    const int r0 = group;
+                    const int r1 = r0 + 8;
+                    const int c0 = (lane % 4) * 2;
+                    const int c1 = c0 + 1;
+
+                    const int global = rr * 16 * Br + cc * 8;
+                    
+                    const int idx0 = global + r0 * Br + c0;
+                    const int idx1 = global + r0 * Br + c1;
+                    const int idx2 = global + r1 * Br + c0;
+                    const int idx3 = global + r1 * Br + c1;
+
+                    acc[idx0] += d1;
+                    acc[idx1] += d2;
+                    acc[idx2] += d3;
+                    acc[idx3] += d4;
+
+                    __syncthreads();
+                }
+            }
+
+            const size_t globadl = base + (size_t)rowtileid * Br * headdim + rowid * Br;
+            for (size_t i = tid; i < (size_t)Br * Br; i += blockDim.x) {
+                dL_dK[globadl + i] = __float2half(acc[i]);
+            }
+            __syncthreads();
+        }
+    }
+}
 #include "flashattn.h"

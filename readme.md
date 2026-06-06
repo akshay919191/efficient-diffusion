@@ -15,13 +15,15 @@ and kernel behaviour can be probed in a realistic setting.
   - `welford` – numerically stable online mean/variance for LayerNorm/GroupNorm
 - A benchmark harness that profiles latency and GPU memory per kernel
 
+## disclaimer - my kernels are hardcoded for some specific dims acc to my needs you can adjust
+
 ## Motivation
 This is not a model for pretty pictures. It's a playground to compare
 custom kernel implementations against PyTorch's compiled backend. Flickr8k
 is perfect: diverse captions, tiny footprint, trains in a couple of days
 on a single consumer GPU.
 
-## Model Parameters
+## Model Parameters(reason for this much big models for small dataset is to check speed nothing else)
 
 | Component      | Parameters | Status          |
 |---------------|-----------|-----------------|
